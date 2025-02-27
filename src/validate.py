@@ -36,6 +36,8 @@ from client.fed_ledger import FedLedger
 from peft import PeftModel
 import sys
 import math
+import modal
+model_cache_volume = modal.Volume.from_name("flock-validator-models")
 
 load_dotenv()
 TIME_SLEEP = int(os.getenv("TIME_SLEEP", 60 * 3))
@@ -46,9 +48,6 @@ if FLOCK_API_KEY is None:
 LOSS_FOR_MODEL_PARAMS_EXCEED = 999.0
 HF_TOKEN = os.getenv("HF_TOKEN")
 IS_DOCKER_CONTAINER = os.getenv("IS_DOCKER_CONTAINER", False)
-
-if not IS_DOCKER_CONTAINER:
-    import git  # only import git in non-docker container environment because it is not installed in docker image
 
 if HF_TOKEN is None:
     raise ValueError(
@@ -118,15 +117,13 @@ def load_model(
 ) -> Trainer:
     logger.info(f"Loading model from base model: {model_name_or_path}")
 
-    if val_args.use_cpu:
-        torch_dtype = torch.float32
-    else:
-        torch_dtype = torch.float16 if val_args.fp16 else torch.bfloat16
+    torch_dtype = torch.float16
     model_kwargs = dict(
         trust_remote_code=True,
         torch_dtype=torch_dtype,
         use_cache=False,
         device_map=None,
+        cache_dir="/data"
     )
     # check whether it is a lora weight
     if download_lora_config(model_name_or_path, revision):
@@ -171,33 +168,6 @@ def load_model(
     return model
 
 
-def is_latest_version(repo_path: str):
-    """
-    Check if the current branch is up-to-date with the remote main branch.
-    Parameters:
-    - repo_path (str or Path): The path to the git repository.
-    """
-    try:
-        repo = git.Repo(repo_path)
-        origin = repo.remotes.origin
-        origin.fetch()
-
-        local_commit = repo.commit("main")
-        remote_commit = repo.commit("origin/main")
-
-        if local_commit.hexsha != remote_commit.hexsha:
-            logger.error(
-                "The local code is not up to date with the main branch.Pls update your version"
-            )
-            raise
-    except git.exc.InvalidGitRepositoryError:
-        logger.error("This is not a git repository.")
-        raise
-    except Exception as e:
-        logger.error("An error occurred: %s", str(e))
-        raise
-
-
 def load_sft_dataset(
     eval_file: str, max_seq_length: int, template_name: str, tokenizer: AutoTokenizer
 ) -> UnifiedSFTDataset:
@@ -211,7 +181,7 @@ def load_sft_dataset(
 
 
 def clean_model_cache(
-    auto_clean_cache: bool, cache_path: str = file_utils.default_cache_path
+    auto_clean_cache: bool, cache_path: str = "/data"
 ):
     """
     Cleans up the local model cache directory by removing directories that are not
@@ -238,44 +208,12 @@ def clean_model_cache(
     except (OSError, shutil.Error) as e:
         logger.error(f"Failed to clean up the local model cache: {e}")
 
-
-@click.group()
-def cli():
-    pass
-
-
-@click.command()
-@click.option("--model_name_or_path", required=True, type=str, help="")
-@click.option("--base_model", required=True, type=str, help="")
-@click.option("--eval_file", default="./data/dummy_data.jsonl", type=str, help="")
-@click.option("--context_length", required=True, type=int)
-@click.option("--max_params", required=True, type=int)
-@click.option(
-    "--validation_args_file",
-    type=str,
-    default="validation_config.json.example",
-    help="",
-)
-@click.option(
-    "--assignment_id",
-    type=str,
-    help="The id of the validation assignment",
-)
-@click.option(
-    "--local_test",
-    is_flag=True,
-    help="Run the script in local test mode to avoid submitting to the server",
-)
-@click.option(
-    "--lora_only", type=bool, default=True, help="Only validate repo with lora weight"
-)
 def validate(
     model_name_or_path: str,
     base_model: str,
     eval_file: str,
     context_length: int,
     max_params: int,
-    validation_args_file: str,
     assignment_id: str = None,
     local_test: bool = False,
     lora_only: bool = True,
@@ -292,10 +230,16 @@ def validate(
     try:
         fed_ledger = FedLedger(FLOCK_API_KEY)
         parser = HfArgumentParser(TrainingArguments)
-        val_args = parser.parse_json_file(json_file=validation_args_file)[0]
+        val_args = TrainingArguments(
+            per_device_eval_batch_size=1,
+            fp16=True,
+            output_dir=".",
+            remove_unused_columns=False,
+        )
         gpu_type = get_gpu_type()
 
         tokenizer = load_tokenizer(model_name_or_path)
+        eval_file= download_file(eval_file)
         eval_dataset = load_sft_dataset(
             eval_file, context_length, template_name=base_model, tokenizer=tokenizer
         )
@@ -378,137 +322,3 @@ def validate(
         if os.path.exists("lora"):
             logger.debug("Removing lora folder")
             os.system("rm -rf lora")
-
-
-@click.command()
-@click.option(
-    "--validation_args_file",
-    type=str,
-    default="validation_config.json.example",
-    help="",
-)
-@click.option(
-    "--task_id",
-    type=str,
-    help="The id of the task",
-)
-@click.option(
-    "--auto_clean_cache",
-    type=bool,
-    default=True,
-    help="Auto clean the model cache except for the base model",
-)
-@click.option(
-    "--lora_only", type=bool, default=True, help="Only validate repo with lora weight"
-)
-def loop(
-    validation_args_file: str,
-    task_id: str = None,
-    auto_clean_cache: bool = True,
-    lora_only: bool = True,
-):
-    if task_id is None:
-        raise ValueError("task_id is required for asking assignment_id")
-    if auto_clean_cache:
-        logger.info("Auto clean the model cache except for the base model")
-    else:
-        logger.info("Skip auto clean the model cache")
-
-    repo_path = Path(__file__).resolve().parent.parent
-
-    if not IS_DOCKER_CONTAINER:
-        is_latest_version(repo_path)
-    else:
-        logger.info("Skip checking the latest version in docker container")
-        logger.info(
-            "Please make sure you are using the latest version of the docker image."
-        )
-
-    fed_ledger = FedLedger(FLOCK_API_KEY)
-    task_id_list = task_id.split(",")
-    logger.info(f"Validating task_id: {task_id_list}")
-    last_successful_request_time = [time.time()] * len(task_id_list)
-    while True:
-        clean_model_cache(auto_clean_cache)
-
-        for index, task_id_num in enumerate(task_id_list):
-            resp = fed_ledger.request_validation_assignment(task_id_num)
-            if resp.status_code == 200:
-                last_successful_request_time[index] = time.time()
-                break
-            else:
-                if resp.json() == {
-                    "detail": "No task submissions available to validate"
-                }:
-                    logger.info(
-                        "Failed to ask assignment_id: No task submissions available to validate"
-                    )
-                else:
-                    logger.error(f"Failed to ask assignment_id: {resp.content}")
-                if resp.json() == {
-                    "detail": "Rate limit reached for validation assignment lookup: 1 per 3 minutes"
-                }:
-                    time_since_last_success = (
-                        time.time() - last_successful_request_time[index]
-                    )
-                    if time_since_last_success < ASSIGNMENT_LOOKUP_INTERVAL:
-                        time_to_sleep = (
-                            ASSIGNMENT_LOOKUP_INTERVAL - time_since_last_success
-                        )
-                        logger.info(f"Sleeping for {int(time_to_sleep)} seconds")
-                        time.sleep(time_to_sleep)
-                    continue
-                else:
-                    logger.info(f"Sleeping for {int(TIME_SLEEP)} seconds")
-                    time.sleep(TIME_SLEEP)
-                    continue
-
-        if resp is None or resp.status_code != 200:
-            continue
-        resp = resp.json()
-        eval_file = download_file(resp["data"]["validation_set_url"])
-        revision = resp["task_submission"]["data"].get("revision", "main")
-        assignment_id = resp["id"]
-
-        for attempt in range(3):
-            try:
-                ctx = click.Context(validate)
-                ctx.invoke(
-                    validate,
-                    model_name_or_path=resp["task_submission"]["data"]["hg_repo_id"],
-                    base_model=resp["data"]["base_model"],
-                    eval_file=eval_file,
-                    context_length=resp["data"]["context_length"],
-                    max_params=resp["data"]["max_params"],
-                    validation_args_file=validation_args_file,
-                    assignment_id=resp["id"],
-                    local_test=False,
-                    lora_only=lora_only,
-                    revision=revision,
-                )
-                break  # Break the loop if no exception
-            except KeyboardInterrupt:
-                # directly terminate the process if keyboard interrupt
-                sys.exit(1)
-            except OSError as e:
-                handle_os_error(e, assignment_id, fed_ledger)
-            except RuntimeError as e:
-                handle_runtime_error(e, assignment_id, fed_ledger)
-            except ValueError as e:
-                handle_value_error(e, assignment_id, fed_ledger)
-            except Exception as e:
-                logger.error(f"Attempt {attempt + 1} failed: {e}")
-                if attempt == 2:
-                    logger.error(
-                        f"Marking assignment {assignment_id} as failed after 3 attempts"
-                    )
-                    fed_ledger.mark_assignment_as_failed(assignment_id)
-
-        os.remove(eval_file)
-
-
-cli.add_command(validate)
-cli.add_command(loop)
-
-if __name__ == "__main__":
-    cli()
